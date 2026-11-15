@@ -7,7 +7,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs";
 import { basename, join } from "path";
 import { execSync } from "child_process";
-import { homedir, tmpdir } from "os";
 
 // ── ANSI colors ───────────────────────────────────────────────────────────────
 const c = {
@@ -83,10 +82,10 @@ function buildBar(pct: number, width = 10): string {
   return `${color}${"●".repeat(filled)}${partial}${c.dim}${"○".repeat(empty)}${c.reset}`;
 }
 
-function fmtRelativeTime(isoStr: string | undefined): string {
-  if (!isoStr || isoStr === "null") return "";
+function fmtRelativeTime(epochSec: number | undefined): string {
+  if (!epochSec) return "";
   try {
-    const d = new Date(isoStr);
+    const d = new Date(epochSec * 1000);
     if (isNaN(d.getTime())) return "";
     const diffMs = d.getTime() - Date.now();
     if (diffMs <= 0) {
@@ -102,10 +101,10 @@ function fmtRelativeTime(isoStr: string | undefined): string {
   }
 }
 
-function fmtResetDateTime(isoStr: string | undefined): string {
-  if (!isoStr || isoStr === "null") return "";
+function fmtResetDateTime(epochSec: number | undefined): string {
+  if (!epochSec) return "";
   try {
-    const d = new Date(isoStr);
+    const d = new Date(epochSec * 1000);
     if (isNaN(d.getTime())) return "";
     return d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true }).toLowerCase().replace(/\./g, "");
   } catch {
@@ -119,74 +118,6 @@ function exec(cmd: string, cwd?: string): string {
   } catch {
     return "";
   }
-}
-
-// ── OAuth token resolution ────────────────────────────────────────────────────
-
-function getOAuthToken(): string {
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return process.env.CLAUDE_CODE_OAUTH_TOKEN;
-
-  // macOS keychain
-  try {
-    const blob = exec('security find-generic-password -s "Claude Code-credentials" -w');
-    if (blob) {
-      const token = JSON.parse(blob)?.claudeAiOauth?.accessToken;
-      if (token) return token;
-    }
-  } catch {}
-
-  // credentials file
-  const credsFile = join(homedir(), ".claude", ".credentials.json");
-  if (existsSync(credsFile)) {
-    try {
-      const token = JSON.parse(readFileSync(credsFile, "utf8"))?.claudeAiOauth?.accessToken;
-      if (token) return token;
-    } catch {}
-  }
-
-  return "";
-}
-
-// ── Fetch usage data (cached 60s) ─────────────────────────────────────────────
-
-interface UsageData {
-  five_hour?: { utilization: number; resets_at?: string };
-  seven_day?: { utilization: number; resets_at?: string };
-  extra_usage?: { is_enabled: boolean; utilization: number; used_credits: number; monthly_limit: number };
-}
-
-function fetchUsageData(): UsageData | null {
-  ensureTmpDir();
-  const cacheFile = join(TMP_DIR, "statusline-usage-cache.json");
-  const cacheMaxAge = 60;
-
-  if (existsSync(cacheFile)) {
-    const age = (Date.now() - statSync(cacheFile).mtimeMs) / 1000;
-    if (age < cacheMaxAge) {
-      try { return JSON.parse(readFileSync(cacheFile, "utf8")); } catch {}
-    }
-  }
-
-  const token = getOAuthToken();
-  if (token) {
-    const response = exec(
-      `curl -s --max-time 5 -H "Accept: application/json" -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" -H "anthropic-beta: oauth-2025-04-20" -H "User-Agent: claude-code/2.1.34" "https://api.anthropic.com/api/oauth/usage"`
-    );
-    if (response) {
-      try {
-        const data = JSON.parse(response);
-        if (data.five_hour) {
-          writeFileSync(cacheFile, response);
-          return data;
-        }
-      } catch {}
-    }
-  }
-
-  if (existsSync(cacheFile)) {
-    try { return JSON.parse(readFileSync(cacheFile, "utf8")); } catch {}
-  }
-  return null;
 }
 
 // ── Turn timing stats ─────────────────────────────────────────────────────────
@@ -285,18 +216,14 @@ async function modeStatusline() {
   const cacheRead = data.context_window?.current_usage?.cache_read_input_tokens || 0;
   const outputTok = data.context_window?.current_usage?.output_tokens || 0;
   const currentTok = inputTok + cacheCreate + cacheRead;
-  const pctUsed = ctxSize > 0 ? Math.round((currentTok * 100) / ctxSize) : 0;
+  const pctUsed = data.context_window?.used_percentage ?? (ctxSize > 0 ? Math.round((currentTok * 100) / ctxSize) : 0);
 
   // Cost
   const costUsd = data.cost?.total_cost_usd || 0;
   const costFmt = `$${costUsd.toFixed(3)}`;
 
   // Effort level
-  let effort = "default";
-  const settingsPath = join(homedir(), ".claude", "settings.json");
-  if (existsSync(settingsPath)) {
-    try { effort = JSON.parse(readFileSync(settingsPath, "utf8")).effortLevel || "default"; } catch {}
-  }
+  const effort = data.effort?.level || "default";
 
   // Git
   let gitBranch = "";
@@ -325,7 +252,7 @@ async function modeStatusline() {
   ];
   if (sessionDur) parts1.push(`${c.dim}⏱ ${c.reset}${c.white}${sessionDur}${c.reset}`);
 
-  const effortIcon = effort === "high" ? `${c.magenta}●` : `${c.dim}◑`;
+  const effortIcon = ["high", "xhigh", "max"].includes(effort) ? `${c.magenta}●` : `${c.dim}◑`;
   parts1.push(`${effortIcon} ${effort}${c.reset}`);
 
   const line1 = parts1.join(SEP);
@@ -341,31 +268,21 @@ async function modeStatusline() {
     );
   }
 
-  // Rate limits
-  const usage = fetchUsageData();
-  if (usage) {
-    if (usage.five_hour) {
-      const pct = Math.round(usage.five_hour.utilization);
-      const reset = fmtRelativeTime(usage.five_hour.resets_at);
-      barLines.push(
-        `${c.white}current${c.reset} ${buildBar(pct)} ${colorForPct(pct)}${String(pct).padStart(3)}%${c.reset} ${c.dim}⟳${c.reset} ${c.white}${reset}${c.reset}`
-      );
-    }
-    if (usage.seven_day) {
-      const pct = Math.round(usage.seven_day.utilization);
-      const reset = fmtResetDateTime(usage.seven_day.resets_at);
-      barLines.push(
-        `${c.white}weekly${c.reset}  ${buildBar(pct)} ${colorForPct(pct)}${String(pct).padStart(3)}%${c.reset} ${c.dim}⟳${c.reset} ${c.white}${reset}${c.reset}`
-      );
-    }
-    if (usage.extra_usage?.is_enabled) {
-      const pct = Math.round(usage.extra_usage.utilization);
-      const used = (usage.extra_usage.used_credits / 100).toFixed(2);
-      const limit = (usage.extra_usage.monthly_limit / 100).toFixed(2);
-      barLines.push(
-        `${c.white}extra${c.reset}   ${buildBar(pct)} ${colorForPct(pct)}$${used}${c.dim}/${c.reset}${c.white}$${limit}${c.reset}`
-      );
-    }
+  // Rate limits (provided on stdin; each window may be absent)
+  const limits = data.rate_limits || {};
+  const windows = [
+    ["5-hour", limits.five_hour, fmtRelativeTime],
+    ["weekly", limits.seven_day, fmtResetDateTime],
+    ["spend", limits.spend_limit, fmtResetDateTime],
+  ];
+  for (const [label, w, fmtReset] of windows) {
+    if (w?.used_percentage == null) continue;
+    const pct = Math.round(w.used_percentage);
+    const reset = fmtReset(w.resets_at);
+    const dollars = w.used_usd != null && w.limit_usd != null ? ` ${c.dim}$${w.used_usd.toFixed(2)}/$${w.limit_usd.toFixed(2)}${c.reset}` : "";
+    barLines.push(
+      `${c.white}${label.padEnd(7)}${c.reset} ${buildBar(pct)} ${colorForPct(pct)}${String(pct).padStart(3)}%${c.reset}${dollars}${reset ? ` ${c.dim}⟳${c.reset} ${c.white}${reset}${c.reset}` : ""}`
+    );
   }
 
   // Turn stats

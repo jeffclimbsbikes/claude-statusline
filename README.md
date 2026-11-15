@@ -19,16 +19,17 @@ Model name, session cost, output tokens, directory + git branch, session duratio
 | Row | What it tracks |
 |-----|----------------|
 | `context` | Context window usage with token counts — know when autocompact is coming |
-| `current` | 5-hour rolling rate limit with countdown to reset |
+| `5-hour` | 5-hour rate limit with countdown to reset (only when Claude Code reports one) |
 | `weekly` | 7-day rate limit with reset date + time |
-| `extra` | Extra usage spend tracking (if enabled on your plan) |
+| `spend` | Spend limit with dollars used / limit (only behind a Claude apps gateway with spend limits) |
 | `turns` | Per-turn wall-clock timing: count, last + completion time, avg, p50, max |
 
 ### Details
 
 - Progress bars use gradual-fill dots (`○ ◔ ◑ ◕ ●`) that color-shift from green to red as usage climbs
-- Context window tracks `input_tokens + cache_creation + cache_read` against `context_window_size`, matching Claude Code's own `used_percentage` calculation
-- Rate limits come from the `rate_limits` object in the statusline JSON (available for Pro/Max subscribers after the first API response)
+- Context window uses Claude Code's own `used_percentage`, with token counts from `input_tokens + cache_creation + cache_read` against `context_window_size`
+- Rate limits come straight from the `rate_limits` object in the statusline JSON (Pro/Max/Ultra subscribers, after the first API response). No OAuth token or usage API calls. Each window shows only when Claude Code reports it
+- Effort level comes from the statusline JSON, so it reflects per-model overrides rather than the global setting
 - Reset times show relative countdowns when in the future, absolute times when stale
 - Turn timing captures full wall-clock time per turn — thinking, tool calls, subagent orchestration — not just API latency
 - Turn stats include the HH:MM:SS timestamp of the last completion so you can tell at a glance when Claude last finished working
@@ -40,7 +41,7 @@ Two implementations, identical output — pick what fits your stack:
 | | [`ts/`](ts/) | [`sh/`](sh/) |
 |---|---|---|
 | **Files** | 1 (`statusline.ts`) | 3 (`statusline.sh` + 2 hook scripts) |
-| **Runtime** | Node.js + `tsx` | Bash + `jq` + `python3` + `curl` |
+| **Runtime** | Node.js + `tsx` | Bash + `jq` + `python3` |
 | **Deps** | `npx tsx` | `brew install jq` (rest ships with macOS) |
 
 ---
@@ -99,7 +100,7 @@ Three scripts — statusline + two hook scripts for turn timing.
 
 - `jq` (`brew install jq` on macOS)
 - `python3` (ships with macOS)
-- `curl` and `git`
+- `git`
 
 ```bash
 cp sh/statusline.sh ~/.claude/statusline.sh
@@ -165,10 +166,9 @@ The statusline reads the history and computes last/avg/p50/max stats. History is
 
 - Gradual-fill progress dots (`◔ ◑ ◕ ●`) with color-coded thresholds
 - Context window bar with token counts
-- 5-hour and 7-day rate limit utilization with countdown to reset
+- Rate limit utilization (weekly, plus 5-hour or spend limit when reported) with time to reset
 - Session cost and output tokens
 - Per-turn wall-clock timing with completion timestamps via hooks
-- Extra usage spend tracking
 - Git branch and dirty state
 
 ## License
